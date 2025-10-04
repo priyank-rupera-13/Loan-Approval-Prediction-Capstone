@@ -8,7 +8,7 @@ import numpy as np
 from pathlib import Path
 import json
 
-APP = FastAPI(title="Loan Approval API", version="1.3")
+APP = FastAPI(title="Loan Approval API", version="1.4")
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 MODEL_PATH = BASE_DIR / "models" / "loan_approval_rf_pipeline.joblib"
@@ -17,7 +17,22 @@ FEAT_PATH  = BASE_DIR / "models" / "feature_columns.json"
 PIPELINE = None
 FEATURES: List[str] = []
 
-# ---------------- EMI helpers (tenure in YEARS) ----------------
+# ---------------- Helpers ----------------
+def normalize_rate(r: Optional[float]) -> Optional[float]:
+    """Accept 8.2 or 0.082; return a fraction (0.082)."""
+    if r is None:
+        return None
+    try:
+        r = float(r)
+    except Exception:
+        return None
+    if r < 0:
+        r = 0.0
+    if r > 1.0:
+        r = r / 100.0
+    return r
+
+# EMI (tenure in YEARS)
 def compute_emi(principal: float, annual_rate: float, months: int) -> Optional[float]:
     if principal is None or months is None or months <= 0:
         return None
@@ -57,7 +72,6 @@ def apply_emi_policy_years(income_annum: Optional[float],
         "reason": "EMI exceeds 50% of monthly income" if rule_reject else "EMI within safe limit"
     }
 
-# ---------------- Feature alignment helpers ----------------
 def canonicalize_keys(d: Dict[str, Any]) -> Dict[str, Any]:
     out = {}
     for k, v in d.items():
@@ -69,13 +83,6 @@ def canonicalize_keys(d: Dict[str, Any]) -> Dict[str, Any]:
     return out
 
 def align_dataframe(payloads: List[Dict[str, Any]]) -> pd.DataFrame:
-    """
-    1) Canonicalize keys to match training cleaning.
-    2) Ensure model feature 'loan_term' is in YEARS regardless of what client sends
-       (loan_term_years preferred; fallback to loan_term [treated as years];
-        or derive years from loan_term_months).
-    3) Add any missing training FEATURES as NaN and drop extras.
-    """
     canon = [canonicalize_keys(p) for p in payloads]
     rows = []
     for row in canon:
@@ -97,7 +104,7 @@ def align_dataframe(payloads: List[Dict[str, Any]]) -> pd.DataFrame:
     X = X[FEATURES]
     return X
 
-# ---------------- Pydantic Schemas ----------------
+# ---------------- Schemas ----------------
 class LoanApplication(BaseModel):
     # Training features
     loan_id: Optional[float] = None
@@ -115,12 +122,16 @@ class LoanApplication(BaseModel):
 
     # Convenience
     loan_term_years: Optional[float] = Field(None, description="Preferred: tenure in YEARS")
-    loan_term_months: Optional[float] = Field(None, description="Alternative: tenure in months; will be converted to YEARS")
+    loan_term_months: Optional[float] = Field(None, description="Alternative: tenure in months; converted to YEARS")
+
+    # NEW: allow per-request interest rate (either 8.2 or 0.082)
+    annual_rate: Optional[float] = Field(None, description="Interest rate (8.2 or 0.082). If omitted, uses query param or 0.082.")
 
 class PredictionResponse(BaseModel):
     model_pred: int
     final_pred: int
     prob_approve: float
+    annual_rate_used: float
     emi: Optional[float] = None
     monthly_income: Optional[float] = None
     threshold: Optional[float] = None
@@ -129,7 +140,6 @@ class PredictionResponse(BaseModel):
     reason: str
 
 # ---------------- App lifecycle ----------------
-APP = APP  # alias to keep name stable for uvicorn
 @APP.on_event("startup")
 def load_artifacts():
     global PIPELINE, FEATURES
@@ -166,6 +176,14 @@ def predict(app: LoanApplication, threshold: float = 0.5, annual_rate: float = 0
         raise HTTPException(400, f"Inference failed: {e}")
     model_pred = int(prob >= threshold)
 
+    # Resolve annual rate: body overrides query if provided
+    rate_used = normalize_rate(app.annual_rate) if app.annual_rate is not None else normalize_rate(annual_rate)
+    if rate_used is None:
+        rate_used = 0.082  # final fallback
+    if rate_used < 0 or rate_used > 1.0:
+        raise HTTPException(400, "annual_rate must be >=0 and <=1 (or pass e.g. 8.2 to mean 8.2%).")
+
+    # Tenure in years for policy
     term_years = (
         app.loan_term_years
         if app.loan_term_years is not None
@@ -176,7 +194,7 @@ def predict(app: LoanApplication, threshold: float = 0.5, annual_rate: float = 0
         income_annum=app.income_annum,
         loan_amount=app.loan_amount,
         loan_term_years=term_years,
-        annual_rate=annual_rate
+        annual_rate=rate_used
     )
 
     final_pred = 0 if (policy["rule_applied"] and policy["rule_reject"]) else model_pred
@@ -185,6 +203,7 @@ def predict(app: LoanApplication, threshold: float = 0.5, annual_rate: float = 0
         "model_pred": model_pred,
         "final_pred": final_pred,
         "prob_approve": prob,
+        "annual_rate_used": rate_used,
         "emi": policy["emi"],
         "monthly_income": policy["monthly_income"],
         "threshold": policy["threshold"],
@@ -207,6 +226,12 @@ def predict_batch(apps: List[LoanApplication], threshold: float = 0.5, annual_ra
 
     results = []
     for app, prob, mpred in zip(apps, probs, model_preds):
+        rate_used = normalize_rate(app.annual_rate) if app.annual_rate is not None else normalize_rate(annual_rate)
+        if rate_used is None:
+            rate_used = 0.082
+        if rate_used < 0 or rate_used > 1.0:
+            raise HTTPException(400, "annual_rate must be >=0 and <=1 (or pass e.g. 8.2 to mean 8.2%).")
+
         term_years = (
             app.loan_term_years
             if app.loan_term_years is not None
@@ -216,13 +241,14 @@ def predict_batch(apps: List[LoanApplication], threshold: float = 0.5, annual_ra
             income_annum=app.income_annum,
             loan_amount=app.loan_amount,
             loan_term_years=term_years,
-            annual_rate=annual_rate
+            annual_rate=rate_used
         )
         final_pred = 0 if (policy["rule_applied"] and policy["rule_reject"]) else int(mpred)
         results.append({
             "model_pred": int(mpred),
             "final_pred": int(final_pred),
             "prob_approve": float(prob),
+            "annual_rate_used": float(rate_used),
             "emi": policy["emi"],
             "monthly_income": policy["monthly_income"],
             "threshold": policy["threshold"],
