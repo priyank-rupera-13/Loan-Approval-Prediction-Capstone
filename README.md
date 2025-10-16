@@ -38,11 +38,11 @@ Typical columns: `loan_id, no_of_dependents, education, self_employed, income_an
 ├─ models/
 │  ├─ loan_approval_rf_pipeline.joblib        # Random Forest pipeline
 │  └─ feature_columns.json                    # exact training feature list
-├─ reports/                                   # (optional) metrics, plots
+├─ reports/                                  
 ├─ notebooks/
 │  └─ Loan_Approval_Project.ipynb
-└─ fastapi_app/                               # if you later move the API here
-   └─ main.py
+└─ fastapi_app/                               
+   └─ main.py                                 #API and main.py
 ```
 
 ---
